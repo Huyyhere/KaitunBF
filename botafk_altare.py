@@ -7,6 +7,7 @@ import json
 import time
 import sqlite3
 import os
+import uuid
 from getpass import getpass
 from datetime import datetime, timezone
 
@@ -17,61 +18,87 @@ BOT_TOKEN = getpass("Nhập token bot Discord: ").strip()
 _clear()
 print("Token đã nhận. Đang khởi động bot...")
 
-BASE_URL        = "https://altare.sh"
-MAX_ACC         = 50
-RETRY_DELAY     = 30
-MAX_HB_FAIL     = 5
-CHANNEL_ID      = 1475485961881125006
+BASE_URL     = "https://altare.sh"
+MAX_ACC      = 50
+RETRY_DELAY  = 30
+MAX_HB_FAIL  = 5
+CHANNEL_ID   = 1475485961881125006
+CONFIG_DIR   = "data/config"
+DB_PATH      = "data/afk.db"
 
-intents         = discord.Intents.default()
-client          = discord.Client(intents=intents)
-tree            = app_commands.CommandTree(client)
+os.makedirs(CONFIG_DIR, exist_ok=True)
 
-runtime         = {}
+intents            = discord.Intents.default()
+client             = discord.Client(intents=intents)
+tree               = app_commands.CommandTree(client)
+runtime            = {}
 channel_message_id = None
 
 
-def db():
-    conn = sqlite3.connect("afk.db")
-    conn.row_factory = sqlite3.Row
-    return conn
+def cfg_path(filename):
+    return os.path.join(CONFIG_DIR, filename)
+
+def cfg_save(cfg):
+    fname = cfg.get("_file") or f"{uuid.uuid4().hex[:8]}.json"
+    cfg["_file"] = fname
+    with open(cfg_path(fname), "w", encoding="utf-8") as f:
+        json.dump({k: v for k, v in cfg.items() if k != "_file"}, f, ensure_ascii=False, indent=2)
+    return fname
+
+def cfg_delete(fname):
+    try:
+        os.remove(cfg_path(fname))
+    except:
+        pass
+
 
 def db_init():
-    with db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                user_id INTEGER,
-                name    TEXT,
-                config  TEXT,
-                PRIMARY KEY (user_id, name)
-            )
-        """)
-
-def db_save(user_id, name, cfg):
-    with db() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO accounts VALUES (?, ?, ?)",
-            (user_id, name, json.dumps(cfg, ensure_ascii=False))
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            user_id INTEGER,
+            name    TEXT,
+            file    TEXT,
+            PRIMARY KEY (user_id, name)
         )
+    """)
+    conn.commit()
+    conn.close()
+
+def db_save(user_id, name, fname):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO accounts VALUES (?, ?, ?)",
+        (user_id, name, fname)
+    )
+    conn.commit()
+    conn.close()
 
 def db_delete(user_id, name):
-    with db() as conn:
-        conn.execute("DELETE FROM accounts WHERE user_id=? AND name=?", (user_id, name))
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM accounts WHERE user_id=? AND name=?", (user_id, name))
+    conn.commit()
+    conn.close()
 
 def db_count_all():
-    with db() as conn:
-        return conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+    conn = sqlite3.connect(DB_PATH)
+    count = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+    conn.close()
+    return count
 
 def db_all():
-    with db() as conn:
-        return conn.execute("SELECT * FROM accounts").fetchall()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT user_id, name, file FROM accounts").fetchall()
+    conn.close()
+    return [{"user_id": r[0], "name": r[1], "file": r[2]} for r in rows]
 
 
 class Account:
-    def __init__(self, user_id, name, cfg):
+    def __init__(self, user_id, name, cfg, fname=""):
         self.user_id            = user_id
         self.name               = name
         self.cfg                = cfg
+        self.fname              = fname
         self.token              = cfg["token"] if cfg["token"].startswith("Bearer ") else f"Bearer {cfg['token']}"
         self.tenant_id          = cfg.get("tenant_id", "").strip()
         self.heartbeat_interval = cfg.get("heartbeat_interval", 30)
@@ -173,6 +200,19 @@ class Account:
     def log(self, msg):
         print(f"[{self._ts()}] [{self.name}] {msg}")
 
+    def _write_tenant_to_file(self):
+        if not self.fname:
+            return
+        try:
+            fpath = cfg_path(self.fname)
+            with open(fpath, encoding="utf-8") as f:
+                data = json.load(f)
+            data["tenant_id"] = self.tenant_id
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+
     def _reset_state(self):
         self.hb_ok         = 0
         self.hb_fail       = 0
@@ -270,6 +310,7 @@ class Account:
         if not self.api_start():
             return False, "Gọi API start AFK thất bại."
 
+        self._write_tenant_to_file()
         self.running       = True
         self.session_start = datetime.now()
         self.status        = "hoạt động"
@@ -306,13 +347,7 @@ def build_channel_embed():
         earned  = round(acc.balance - acc.credits_start, 4) if acc.credits_start else 0
         elapsed = str(datetime.now() - acc.session_start).split(".")[0] if acc.session_start else "?"
         hb_rate = round(acc.hb_ok / max(acc.hb_ok + acc.hb_fail, 1) * 100)
-        if acc.status == "hoạt động":
-            icon = "🟢"
-        elif "khởi động" in acc.status:
-            icon = "🔄"
-        else:
-            icon = "🔴"
-
+        icon    = "🟢" if acc.status == "hoạt động" else "🔄" if "khởi động" in acc.status else "🔴"
         embed.add_field(
             name=f"{icon}  {name}",
             value=(
@@ -333,7 +368,7 @@ async def push_channel_status():
         return
 
     embed = build_channel_embed()
-    view  = discord.ui.View()
+    view  = discord.ui.View(timeout=None)
     btn   = discord.ui.Button(label="Làm mới", style=discord.ButtonStyle.secondary, custom_id="refresh_status")
     view.add_item(btn)
 
@@ -353,11 +388,12 @@ async def push_channel_status():
 
 
 async def autocomplete_acc(interaction: discord.Interaction, current: str):
-    uid  = interaction.user.id
-    accs = runtime.get(uid, {})
+    all_names = []
+    for accs in runtime.values():
+        all_names.extend(accs.keys())
     return [
-        app_commands.Choice(name=name, value=name)
-        for name in accs if current.lower() in name.lower()
+        app_commands.Choice(name=n, value=n)
+        for n in all_names if current.lower() in n.lower()
     ][:25]
 
 
@@ -369,19 +405,32 @@ async def on_ready():
 
     print(f"\n{'─'*45}")
     print(f"  Bot: {client.user}")
-    print(f"  Đang khôi phục {len(rows)} tài khoản từ DB...")
+    print(f"  Đang khôi phục {len(rows)} tài khoản từ data/config/...")
     print(f"{'─'*45}")
 
     for row in rows:
-        uid  = row["user_id"]
-        name = row["name"]
-        cfg  = json.loads(row["config"])
-        acc  = Account(uid, name, cfg)
+        uid   = row["user_id"]
+        name  = row["name"]
+        fname = row["file"]
+        fpath = cfg_path(fname)
+
+        if not os.path.exists(fpath):
+            print(f"  ✗  {name}  —  file {fname} không tồn tại, bỏ qua")
+            continue
+
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print(f"  ✗  {name}  —  lỗi đọc file: {e}")
+            continue
+
+        acc = Account(uid, name, cfg, fname=fname)
         ok, msg = acc.start()
         if ok:
             runtime.setdefault(uid, {})[name] = acc
             loaded += 1
-            print(f"  ✓  {name}  (user {uid})")
+            print(f"  ✓  {name}  (file: {fname})")
         else:
             print(f"  ✗  {name}  —  {msg}")
 
@@ -403,10 +452,10 @@ async def on_interaction(interaction: discord.Interaction):
     await client.process_application_commands(interaction)
 
 
-@tree.command(name="thêm", description="Thêm tài khoản AFK mới bằng cách nhập thông tin trực tiếp (tối đa 50)")
+@tree.command(name="thêm", description="Thêm tài khoản AFK mới — nhập trực tiếp (tối đa 50)")
 @app_commands.describe(
     tên="Tên tài khoản hiển thị",
-    token="Token Bearer (bắt đầu bằng Bearer hoặc eyJ...)",
+    token="Token Bearer (Bearer eyJ... hoặc chỉ eyJ...)",
     heartbeat="Chu kỳ heartbeat tính bằng giây (mặc định 30)",
     stats="Chu kỳ cập nhật số dư tính bằng giây (mặc định 60)"
 )
@@ -417,26 +466,22 @@ async def cmd_them(
     heartbeat: int = 30,
     stats: int = 60
 ):
-    uid = interaction.user.id
+    uid  = interaction.user.id
+    name = tên.strip()
 
     if db_count_all() >= MAX_ACC:
         await interaction.response.send_message(
-            f"Đã đạt tối đa **{MAX_ACC} tài khoản** toàn hệ thống. Xoá bớt trước khi thêm mới.",
-            ephemeral=True
-        )
+            f"Đã đạt tối đa **{MAX_ACC} tài khoản** toàn hệ thống.", ephemeral=True)
         return
 
-    name = tên.strip()
     if not name:
-        await interaction.response.send_message("Tên tài khoản không được để trống.", ephemeral=True)
+        await interaction.response.send_message("Tên không được để trống.", ephemeral=True)
         return
 
     for accs in runtime.values():
         if name in accs:
             await interaction.response.send_message(
-                f"Tên `{name}` đã tồn tại trong hệ thống. Chọn tên khác.",
-                ephemeral=True
-            )
+                f"Tên `{name}` đã tồn tại. Chọn tên khác.", ephemeral=True)
             return
 
     token = token.strip()
@@ -454,24 +499,30 @@ async def cmd_them(
 
     await interaction.response.defer(ephemeral=True)
 
-    acc = Account(uid, name, cfg)
+    fname = f"{uuid.uuid4().hex[:8]}.json"
+    acc   = Account(uid, name, cfg, fname=fname)
     ok, msg = await asyncio.get_event_loop().run_in_executor(None, acc.start)
 
     if not ok:
         await interaction.followup.send(f"Lỗi khởi động: **{msg}**", ephemeral=True)
         return
 
+    cfg["tenant_id"] = acc.tenant_id
+    with open(cfg_path(fname), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
     runtime.setdefault(uid, {})[name] = acc
-    db_save(uid, name, cfg)
+    db_save(uid, name, fname)
 
     slot_con_lai = MAX_ACC - db_count_all()
-    embed = discord.Embed(title="Đã thêm tài khoản AFK", color=0x2ecc71)
+    embed = discord.Embed(title="✅  Đã thêm tài khoản AFK", color=0x2ecc71)
     embed.add_field(name="Tên",          value=f"`{name}`",                   inline=True)
     embed.add_field(name="Tenant",       value=f"`{acc.tenant_id[:18]}...`",   inline=True)
     embed.add_field(name="Slot còn lại", value=f"`{slot_con_lai}/{MAX_ACC}`",  inline=True)
     embed.add_field(name="Heartbeat",    value=f"`{acc.heartbeat_interval}s`", inline=True)
     embed.add_field(name="Stats",        value=f"`{acc.stats_interval}s`",     inline=True)
-    embed.set_footer(text="Tài khoản đã được lưu — tự khôi phục khi bot restart")
+    embed.add_field(name="File config",  value=f"`data/config/{fname}`",       inline=False)
+    embed.set_footer(text="Tự khôi phục khi bot restart")
     await interaction.followup.send(embed=embed, ephemeral=True)
     await push_channel_status()
 
@@ -480,39 +531,38 @@ async def cmd_them(
 @app_commands.describe(tài_khoản="Tên tài khoản muốn xoá")
 @app_commands.autocomplete(tài_khoản=autocomplete_acc)
 async def cmd_xoa(interaction: discord.Interaction, tài_khoản: str):
-    uid  = interaction.user.id
-    accs = runtime.get(uid, {})
+    found_uid  = None
+    found_accs = None
+    for u, a in runtime.items():
+        if tài_khoản in a:
+            found_uid  = u
+            found_accs = a
+            break
 
-    if tài_khoản not in accs:
-        found_uid = None
-        for u, a in runtime.items():
-            if tài_khoản in a:
-                found_uid = u
-                accs = a
-                uid  = u
-                break
-        if found_uid is None:
-            await interaction.response.send_message(
-                f"Không tìm thấy `{tài_khoản}`.\nDùng `/danh-sách` để xem tất cả.", ephemeral=True)
-            return
+    if found_uid is None:
+        await interaction.response.send_message(
+            f"Không tìm thấy `{tài_khoản}`.", ephemeral=True)
+        return
 
-    accs[tài_khoản].stop()
-    del accs[tài_khoản]
-    if not accs:
-        runtime.pop(uid, None)
+    acc = found_accs[tài_khoản]
+    acc.stop()
+    cfg_delete(acc.fname)
+    del found_accs[tài_khoản]
+    if not found_accs:
+        runtime.pop(found_uid, None)
 
-    db_delete(uid, tài_khoản)
+    db_delete(found_uid, tài_khoản)
 
     embed = discord.Embed(
         title="Đã xoá tài khoản",
-        description=f"Tài khoản **{tài_khoản}** đã dừng và xoá khỏi hệ thống.",
+        description=f"**{tài_khoản}** đã dừng, xoá DB và xoá `data/config/{acc.fname}`.",
         color=0xe74c3c
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
     await push_channel_status()
 
 
-@tree.command(name="danh-sách", description="Xem tất cả tài khoản AFK đang chạy trong hệ thống")
+@tree.command(name="danh-sách", description="Xem tất cả tài khoản AFK đang chạy")
 async def cmd_danh_sach(interaction: discord.Interaction):
     all_accs = []
     for uid, accs in runtime.items():
@@ -532,7 +582,6 @@ async def cmd_danh_sach(interaction: discord.Interaction):
         title=f"Tài khoản AFK — {len(all_accs)}/{MAX_ACC}",
         color=0x00d4aa
     )
-
     for uid, name, acc in all_accs:
         earned  = round(acc.balance - acc.credits_start, 4) if acc.credits_start else 0
         elapsed = str(datetime.now() - acc.session_start).split(".")[0] if acc.session_start else "?"
@@ -546,8 +595,7 @@ async def cmd_danh_sach(interaction: discord.Interaction):
             ),
             inline=False
         )
-
-    embed.set_footer(text="Dùng /trạng-thái để xem chi tiết từng tài khoản")
+    embed.set_footer(text="Dùng /trạng-thái để xem chi tiết")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -563,7 +611,7 @@ async def cmd_trang_thai(interaction: discord.Interaction, tài_khoản: str):
 
     if acc is None:
         await interaction.response.send_message(
-            f"Không tìm thấy `{tài_khoản}`.\nDùng `/danh-sách` để xem.", ephemeral=True)
+            f"Không tìm thấy `{tài_khoản}`.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -578,16 +626,17 @@ async def cmd_trang_thai(interaction: discord.Interaction, tài_khoản: str):
         title=f"{icon}  {tài_khoản}",
         color=0x2ecc71 if acc.status == "hoạt động" else 0xe67e22
     )
-    embed.add_field(name="Trạng thái",    value=f"`{acc.status}`",               inline=True)
-    embed.add_field(name="Khởi động lại", value=f"`{acc.restart_count} lần`",    inline=True)
-    embed.add_field(name="\u200b",        value="\u200b",                          inline=True)
-    embed.add_field(name="Số dư",         value=f"`{acc.balance:.4f} cr`",        inline=True)
-    embed.add_field(name="Kiếm được",     value=f"`+{earned:.4f} cr`",            inline=True)
-    embed.add_field(name="Tốc độ",        value=f"`{per_min} cr/min`",            inline=True)
-    embed.add_field(name="Uptime",        value=f"`{elapsed}`",                   inline=True)
-    embed.add_field(name="Heartbeat",     value=f"`{hb_rate}% OK`",               inline=True)
+    embed.add_field(name="Trạng thái",    value=f"`{acc.status}`",                inline=True)
+    embed.add_field(name="Khởi động lại", value=f"`{acc.restart_count} lần`",     inline=True)
+    embed.add_field(name="\u200b",        value="\u200b",                           inline=True)
+    embed.add_field(name="Số dư",         value=f"`{acc.balance:.4f} cr`",         inline=True)
+    embed.add_field(name="Kiếm được",     value=f"`+{earned:.4f} cr`",             inline=True)
+    embed.add_field(name="Tốc độ",        value=f"`{per_min} cr/min`",             inline=True)
+    embed.add_field(name="Uptime",        value=f"`{elapsed}`",                    inline=True)
+    embed.add_field(name="Heartbeat",     value=f"`{hb_rate}% OK`",                inline=True)
     embed.add_field(name="HB OK / Fail",  value=f"`{acc.hb_ok} / {acc.hb_fail}`", inline=True)
-    embed.add_field(name="Tenant ID",     value=f"`{acc.tenant_id}`",             inline=False)
+    embed.add_field(name="Tenant ID",     value=f"`{acc.tenant_id}`",              inline=False)
+    embed.add_field(name="File config",   value=f"`data/config/{acc.fname}`",      inline=False)
     embed.set_footer(text=f"Cập nhật lúc {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
